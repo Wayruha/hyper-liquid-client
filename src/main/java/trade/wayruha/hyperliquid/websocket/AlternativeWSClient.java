@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.neovisionaries.ws.client.*;
 import lombok.Getter;
+import lombok.Setter;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import trade.wayruha.hyperliquid.HyperLiquidConfig;
@@ -17,6 +18,7 @@ import trade.wayruha.hyperliquid.util.IdGenerator;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -25,6 +27,7 @@ import static trade.wayruha.hyperliquid.config.Constant.MAX_WS_BATCH_SUBSCRIPTIO
 @Slf4j
 public class AlternativeWSClient<T> {
     protected static long WEB_SOCKET_RECONNECTION_DELAY_MS = 10_000;
+    protected static final int MAX_RECONNECTION_BACKOFF = 2 * 60_000;
     protected static final WSMessage pingRequest = new WSMessage("ping");
 
     protected final HyperLiquidConfig config;
@@ -35,11 +38,12 @@ public class AlternativeWSClient<T> {
     protected final int id;
     protected final String logPrefix;
     protected final WebSocketFactory wsFactory;
-    protected final AtomicInteger reconnectionCounter;
     protected Set<Subscription> subscriptions;
     protected WebSocket webSocket;
     @Getter
     protected long lastReceivedTime;
+    @Setter
+    protected RetryStrategy<Boolean, Boolean> retryStrategy;
 
     @SneakyThrows
     public AlternativeWSClient(ApiClient apiClient, ObjectMapper mapper, WebSocketCallback<T> callback) {
@@ -48,10 +52,10 @@ public class AlternativeWSClient<T> {
         this.callback = callback;
         this.objectMapper = mapper;
         this.subscriptions = Set.of();
-        this.reconnectionCounter = new AtomicInteger(0);
         this.id = IdGenerator.getNextId();
         this.logPrefix = "[ws-" + this.id + "]";
         this.wsFactory = getWebSocketFactory();
+        this.retryStrategy = new ExponentialRetryReconnectStrategy(config.getWebSocketMaxReconnectAttempts(), WEB_SOCKET_RECONNECTION_DELAY_MS, MAX_RECONNECTION_BACKOFF);
     }
 
     @SneakyThrows
@@ -118,20 +122,21 @@ public class AlternativeWSClient<T> {
 
     @SneakyThrows
     public boolean reConnect() {
-        boolean success = false;
-        while (!success && (config.isWebSocketReconnectAlways() || reconnectionCounter.incrementAndGet() < config.getWebSocketMaxReconnectAttempts())) {
+        final AtomicInteger reconnectionCounter = new AtomicInteger(0);
+        final Callable<Boolean> callable = () -> {
             try {
-                log.debug("{} Try to reconnect. Attempt #{}", logPrefix, reconnectionCounter.get());
+                log.debug("{} Try to reconnect. Attempt #{}", logPrefix, reconnectionCounter.incrementAndGet());
                 close();
                 connect(this.subscriptions);
-                success = true;
                 log.info("{} Successfully reconnected to WebSocket channels: {}.", logPrefix, this.subscriptions);
+                return true;
             } catch (Exception e) {
                 log.error("{} [Connection error] Error while reconnecting: {}", logPrefix, e.getMessage(), e);
                 Thread.sleep(WEB_SOCKET_RECONNECTION_DELAY_MS);
+                return false;
             }
-        }
-        return success;
+        };
+        return this.retryStrategy.call(callable);
     }
 
     private void handleMessage(String message) {
@@ -174,7 +179,7 @@ public class AlternativeWSClient<T> {
         return factory;
     }
 
-    private static void logOpeningException(OpeningHandshakeException e) {
+    private void logOpeningException(OpeningHandshakeException e) {
         final StatusLine sl = e.getStatusLine();
         String message = String.format("=== Status Line ===|HTTP Version  = %s|Status Code   = %d|Reason Phrase = %s|",
                 sl.getHttpVersion(), sl.getStatusCode(), sl.getReasonPhrase());
@@ -186,7 +191,7 @@ public class AlternativeWSClient<T> {
                 .map(entry -> entry.getValue() == null ? entry.getKey() : String.format("%s: %s", entry.getKey(), String.join(".", entry.getValue())))
                 .collect(Collectors.joining("|"));
         message += headersStr;
-        log.error("{} Opening exception details: {}", message, e.getMessage());
+        log.error("{} Opening exception: {}. Message: {}", logPrefix, message, e.getMessage());
     }
 
     private class AdapterImplementation extends WebSocketAdapter {
@@ -221,6 +226,18 @@ public class AlternativeWSClient<T> {
                 //we need to send ping manually, which is different from the default ping frame
                 sendRequest(pingRequest);
             }
+        }
+
+        @Override
+        public void onPingFrame(WebSocket websocket, WebSocketFrame frame) throws Exception {
+            super.onPingFrame(websocket, frame);
+            lastReceivedTime = System.currentTimeMillis();
+        }
+
+        @Override
+        public void onPongFrame(WebSocket websocket, WebSocketFrame frame) throws Exception {
+            super.onPongFrame(websocket, frame);
+            lastReceivedTime = System.currentTimeMillis();
         }
     }
 }
