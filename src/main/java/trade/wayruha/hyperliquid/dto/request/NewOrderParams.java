@@ -29,14 +29,21 @@ public class NewOrderParams {
   boolean reduceOnly;
   @JsonProperty("t")
   OrderType orderType;
+  @JsonProperty("c")
+  String clientOrderId;
 
-  public NewOrderParams(int assetId, OrderSide orderSide, BigDecimal price, BigDecimal size, boolean reduceOnly, OrderType type) {
+  public NewOrderParams(int assetId, OrderSide orderSide, BigDecimal price, BigDecimal size, boolean reduceOnly, OrderType type, String clientOrderId) {
     this.assetId = assetId;
     this.buy = orderSide.equals(OrderSide.BID);
     this.price = price;
     this.size = size;
     this.reduceOnly = reduceOnly;
     this.orderType = type;
+    this.clientOrderId = clientOrderId;
+  }
+
+  public NewOrderParams(int assetId, OrderSide orderSide, BigDecimal price, BigDecimal size, boolean reduceOnly, OrderType type) {
+   this(assetId, orderSide, price, size, reduceOnly, type, null);
   }
 
   public static class BigDecimalAsStringSerializer extends JsonSerializer<BigDecimal> {

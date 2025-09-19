@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.neovisionaries.ws.client.*;
 import lombok.Getter;
+import lombok.RequiredArgsConstructor;
 import lombok.Setter;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
@@ -17,8 +18,12 @@ import trade.wayruha.hyperliquid.dto.wsrequest.WSSubscriptionMessage;
 import trade.wayruha.hyperliquid.util.IdGenerator;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.Callable;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -26,9 +31,11 @@ import static trade.wayruha.hyperliquid.config.Constant.MAX_WS_BATCH_SUBSCRIPTIO
 
 @Slf4j
 public class AlternativeWSClient<T> {
+    private static final Duration HEALTHY_INACTIVITY_TIME = Duration.ofMinutes(5);
+    protected static final WSMessage pingRequest = new WSMessage("ping");
     protected static long WEB_SOCKET_RECONNECTION_DELAY_MS = 10_000;
     protected static final int MAX_RECONNECTION_BACKOFF = 2 * 60_000;
-    protected static final WSMessage pingRequest = new WSMessage("ping");
+    private final Healthcheck HEALTH_CHECKER = new Healthcheck(HEALTHY_INACTIVITY_TIME);
 
     protected final HyperLiquidConfig config;
     protected final ApiClient apiClient;
@@ -44,6 +51,7 @@ public class AlternativeWSClient<T> {
     protected long lastReceivedTime;
     @Setter
     protected RetryStrategy<Boolean, Boolean> retryStrategy;
+    private ScheduledExecutorService healthcheckExecutor;
 
     @SneakyThrows
     public AlternativeWSClient(ApiClient apiClient, ObjectMapper mapper, WebSocketCallback<T> callback) {
@@ -68,7 +76,7 @@ public class AlternativeWSClient<T> {
                 log.warn("{} Already connected. Closing the current connection.", logPrefix);
                 close();
             }
-            log.info("{} Connecting WS. Subscriptions: {}", logPrefix, subscriptions);
+            log.debug("{} Connecting WS. Subscriptions: {}", logPrefix, subscriptions);
             this.webSocket = wsFactory
                     .createSocket(config.getWebSocketHost())
                     .setMissingCloseFrameAllowed(true)
@@ -77,6 +85,8 @@ public class AlternativeWSClient<T> {
                     .addListener(new AdapterImplementation());
             this.webSocket.connect();
             subscribe(subscriptions);
+            this.healthcheckExecutor = Executors.newSingleThreadScheduledExecutor();
+            this.healthcheckExecutor.schedule(HEALTH_CHECKER, HEALTHY_INACTIVITY_TIME.getSeconds(), TimeUnit.SECONDS);
         } catch (OpeningHandshakeException ex) {
             logOpeningException(ex);
             throw ex;
@@ -100,7 +110,7 @@ public class AlternativeWSClient<T> {
     public boolean sendRequest(WSMessage request) {
         try {
             final String requestStr = objectMapper.writeValueAsString(request);
-            if (!request.equals(pingRequest)) {
+            if (!request.equals(pingRequest) && !request.getMethod().equalsIgnoreCase("subscribe")) {
                 log.debug("{} sending: {}", logPrefix, requestStr);
             }
             webSocket.sendText(requestStr);
@@ -113,10 +123,11 @@ public class AlternativeWSClient<T> {
     }
 
     public void close() {
-        log.info("{} Closing WS.", logPrefix);
+        log.debug("{} Closing WS.", logPrefix);
         if (webSocket != null) {
             webSocket.disconnect();
             webSocket = null;
+            healthcheckExecutor.shutdownNow();
         }
     }
 
@@ -128,7 +139,7 @@ public class AlternativeWSClient<T> {
                 log.debug("{} Try to reconnect. Attempt #{}", logPrefix, reconnectionCounter.incrementAndGet());
                 close();
                 connect(this.subscriptions);
-                log.info("{} Successfully reconnected to WebSocket channels: {}.", logPrefix, this.subscriptions);
+                log.debug("{} Successfully reconnected to WebSocket channels: {}.", logPrefix, this.subscriptions);
                 return true;
             } catch (Exception e) {
                 log.error("{} [Connection error] Error while reconnecting: {}", logPrefix, e.getMessage(), e);
@@ -238,6 +249,19 @@ public class AlternativeWSClient<T> {
         public void onPongFrame(WebSocket websocket, WebSocketFrame frame) throws Exception {
             super.onPongFrame(websocket, frame);
             lastReceivedTime = System.currentTimeMillis();
+        }
+    }
+
+    @RequiredArgsConstructor
+    private class Healthcheck implements Runnable {
+        private final Duration inactivityThreshold;
+
+        @Override
+        public void run() {
+            final long inactivityTime = System.currentTimeMillis() - lastReceivedTime;
+            if (inactivityTime > inactivityThreshold.toMillis()) {
+                log.warn("{} Inactive for {}s", logPrefix, inactivityTime / 1000);
+            }
         }
     }
 }

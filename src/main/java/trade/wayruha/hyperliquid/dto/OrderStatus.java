@@ -11,7 +11,8 @@ public enum OrderStatus {
   CANCELED("canceled"),
   TRIGGERED("triggered"),
   REJECTED("rejected"),
-  MARGIN_CANCELED("marginCanceled");
+  MARGIN_CANCELED("marginCanceled"),
+  REDUCE_ONLY_CANCELLED("reduceOnlyCanceled");
 
   @JsonValue
   @Getter
